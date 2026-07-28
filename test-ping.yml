@@ -1,0 +1,16 @@
+---
+- name: Test Connection to Two Servers
+  hosts: all
+  gather_facts: yes
+  
+  tasks:
+    - name: Ping the servers
+      ansible.builtin.ping:
+
+    - name: Check uptime
+      ansible.builtin.command: uptime
+      register: server_uptime
+
+    - name: Print uptime result
+      ansible.builtin.debug:
+        msg: "{{ server_uptime.stdout }}"
