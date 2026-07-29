@@ -1,0 +1,24 @@
+---
+- name: Check System Info and Run Apt Update
+  hosts: all
+  become: yes  # Required for apt update/upgrade tasks
+
+  tasks:
+    - name: Display the local Ansible version controlling this run
+      ansible.builtin.debug:
+        msg: "Control node / runner Ansible version is {{ ansible_version.full }}"
+      run_once: true
+
+    - name: Gather facts and display Linux OS release details
+      ansible.builtin.debug:
+        msg: "Target server {{ inventory_hostname }} is running {{ ansible_distribution }} {{ ansible_distribution_version }} (Codename: {{ ansible_distribution_release }})"
+
+    - name: Run apt update to refresh package cache
+      ansible.builtin.apt:
+        update_cache: yes
+      register: apt_update_result
+
+    - name: Show apt update status
+      ansible.builtin.debug:
+        msg: "Apt cache updated successfully on {{ inventory_hostname }}"
+      when: apt_update_result is changed
