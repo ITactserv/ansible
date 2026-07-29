@@ -1,0 +1,41 @@
+---
+- name: Smart Non-Disruptive Linux Maintenance
+  hosts: all
+  become: yes
+
+  tasks:
+    - name: Ensure unattended-upgrades or apt cache is refreshed safely
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Perform safe package upgrades (skipping kernel locks if desired)
+      ansible.builtin.apt:
+        upgrade: safe
+      register: apt_safe_upgrade
+
+    - name: Clean up obsolete package archives and dependencies
+      ansible.builtin.apt:
+        autoclean: yes
+        autoremove: yes
+
+    - name: Check which specific services or daemons need a restart (Avoids full reboot)
+      ansible.builtin.shell: |
+        if command -v needs-restart >/dev/null 2>&1; then
+          needs-restart -p
+        elif [ -f /var/run/reboot-required ]; then
+            echo "Kernel or core system updates detected. Checking affected services..."
+            cut -d' ' -f2- /var/run/reboot-required.pkgs 2>/dev/null || echo "See /var/run/reboot-required for details"
+        else
+          echo "No major service restarts required."
+        fi
+      register: service_restart_check
+      changed_when: false
+
+    - name: Display smart maintenance report
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Upgrades applied: {{ apt_safe_upgrade.changed | ternary('Yes', 'Systems already up to date') }}"
+          - "Services/Daemons flagged for graceful reload:"
+          - "{{ service_restart_check.stdout_lines }}"
