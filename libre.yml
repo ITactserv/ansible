@@ -1,0 +1,51 @@
+---
+- name: Check System Info and Install LibreOffice
+  hosts: all
+  become: yes  # Required for package installation tasks
+
+  tasks:
+    - name: Display the local Ansible version controlling this run
+      ansible.builtin.debug:
+        msg: "Control node / runner Ansible version is {{ ansible_version.full }}"
+      run_once: true
+
+    - name: Gather facts and display Linux OS release details
+      ansible.builtin.debug:
+        msg: "Target server {{ inventory_hostname }} is running {{ ansible_distribution }} {{ ansible_distribution_version }} (Codename: {{ ansible_distribution_release }})"
+
+    - name: Run apt update to refresh package cache
+      ansible.builtin.apt:
+        update_cache: yes
+      register: apt_update_result
+
+    - name: Show apt update status
+      ansible.builtin.debug:
+        msg: "Apt cache updated successfully on {{ inventory_hostname }}"
+      when: apt_update_result is changed
+
+    - name: Check if LibreOffice is already installed
+      ansible.builtin.dpkg_selections:
+        name: libreoffice
+      register: libreoffice_check
+      failed_when: false
+
+    - name: Install LibreOffice if not present
+      ansible.builtin.apt:
+        name: libreoffice
+        state: present
+      register: libreoffice_install_result
+      when: libreoffice_check.ansible_facts.pkg_selections['libreoffice'] is not defined or libreoffice_check.ansible_facts.pkg_selections['libreoffice'] != 'install'
+
+    - name: Notify user with a desktop popup (if GUI session active)
+      ansible.builtin.shell: |
+        export DISPLAY=:0
+        export XAUTHORITY=$(find /home/* -maxdepth 2 -name .Xauthority 2>/dev/null | head -n 1)
+        if command -v notify-send &> /dev/null; then
+          notify-send "LibreOffice Installation" "LibreOffice has been successfully installed on {{ inventory_hostname }}!"
+        elif command -v zenity &> /dev/null; then
+          zenity --info --text="LibreOffice has been successfully installed on {{ inventory_hostname }}!" --timeout=10
+        fi
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/$(id -u)"
+      when: libreoffice_install_result is changed
+      failed_when: false
