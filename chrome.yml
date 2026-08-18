@@ -1,0 +1,73 @@
+---
+- name: Check System Info and Install Google Chrome
+  hosts: all
+  become: yes  # Required for APT key/repo configuration and installation
+
+  tasks:
+    - name: Display the local Ansible version controlling this run
+      ansible.builtin.debug:
+        msg: "Control node / runner Ansible version is {{ ansible_version.full }}"
+      run_once: true
+
+    - name: Gather facts and display Linux OS release details
+      ansible.builtin.debug:
+        msg: "Target server {{ inventory_hostname }} is running {{ ansible_distribution }} {{ ansible_distribution_version }} (Codename: {{ ansible_distribution_release }})"
+
+    - name: Run apt update to refresh package cache
+      ansible.builtin.apt:
+        update_cache: yes
+      register: apt_update_result
+
+    - name: Gather installed package facts
+      ansible.builtin.package_facts:
+        manager: auto
+
+    - name: Inform user if Google Chrome is already installed
+      ansible.builtin.debug:
+        msg: "Google Chrome is already installed on {{ inventory_hostname }} (Version: {{ ansible_facts.packages['google-chrome-stable'][0].version }})."
+      when: "'google-chrome-stable' in ansible_facts.packages"
+
+    - name: Setup repository and install Google Chrome
+      block:
+        - name: Ensure keyrings directory exists
+          ansible.builtin.file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: '0755'
+
+        - name: Download Google Chrome signing key
+          ansible.builtin.get_url:
+            url: "https://dl.google.com/linux/linux_signing_key.pub"
+            dest: "/etc/apt/keyrings/google-chrome.asc"
+            mode: '0644'
+
+        - name: Add Google Chrome official APT repository
+          ansible.builtin.apt_repository:
+            repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.asc] http://dl.google.com/linux/chrome/deb/ stable main"
+            state: present
+            filename: google-chrome
+
+        - name: Install Google Chrome package
+          ansible.builtin.apt:
+            name: google-chrome-stable
+            state: present
+            update_cache: yes
+          register: chrome_install_result
+
+      when: "'google-chrome-stable' not in ansible_facts.packages"
+
+    - name: Notify logged-in desktop user via popup notification
+      ansible.builtin.shell: |
+        export DISPLAY=:0
+        export XAUTHORITY=$(find /home/* -maxdepth 2 -name .Xauthority 2>/dev/null | head -n 1)
+        if command -v notify-send &> /dev/null; then
+          notify-send "Google Chrome Installation" "Google Chrome has been successfully installed on {{ inventory_hostname }}!"
+        elif command -v zenity &> /dev/null; then
+          zenity --info --text="Google Chrome has been successfully installed on {{ inventory_hostname }}!" --timeout=10
+        fi
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/$(id -u)"
+      when:
+        - chrome_install_result is defined
+        - chrome_install_result.changed
+      failed_when: false
