@@ -1,0 +1,57 @@
+---
+- name: System Update, Upgrade, and Notification
+  hosts: all
+  become: yes  # Required for apt update/upgrade tasks
+
+  tasks:
+    - name: Display the local Ansible version controlling this run
+      ansible.builtin.debug:
+        msg: "Control node / runner Ansible version is {{ ansible_version.full }}"
+      run_once: true
+
+    - name: Gather facts and display Linux OS release details
+      ansible.builtin.debug:
+        msg: "Target server {{ inventory_hostname }} is running {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: Update apt cache, upgrade all packages, and autoremove unused dependencies
+      ansible.builtin.apt:
+        update_cache: yes
+        upgrade: dist      # 'dist' is equivalent to 'apt-get dist-upgrade' (handles dependency changes safely)
+        autoremove: yes    # Cleans up orphaned dependencies automatically
+        autoclean: yes     # Clears out the local repository of retrieved package files
+      register: apt_upgrade_result
+
+    - name: Show console upgrade status
+      ansible.builtin.debug:
+        msg: >
+          {% if apt_upgrade_result.changed %}
+          System packages were successfully updated and upgraded.
+          {% else %}
+          System is already up to date. No upgrades were necessary.
+          {% endif %}
+
+    - name: Notify logged-in desktop user via popup notification
+      ansible.builtin.shell: |
+        export DISPLAY=:0
+        # Locate the Xauthority file for the primary logged-in user
+        export XAUTHORITY=$(find /home/* -maxdepth 2 -name .Xauthority 2>/dev/null | head -n 1)
+        
+        # Extract the User ID of the GUI user (fallback to 1000 if not found)
+        GUI_UID=$(stat -c %u $XAUTHORITY 2>/dev/null || echo 1000)
+        export XDG_RUNTIME_DIR="/run/user/$GUI_UID"
+        GUI_USER=$(id -nu $GUI_UID)
+
+        # Set the message based on whether packages were upgraded or not
+        if [ "{{ apt_upgrade_result.changed | lower }}" = "true" ]; then
+          MSG="Update complete! New packages were successfully installed on {{ inventory_hostname }}."
+        else
+          MSG="Update check complete. {{ inventory_hostname }} is already fully up to date."
+        fi
+
+        # Trigger the notification using the GUI user's DBUS session
+        if command -v notify-send &> /dev/null; then
+          sudo -u $GUI_USER DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$GUI_UID/bus" notify-send "System Upgrade" "$MSG" -i software-update-available
+        elif command -v zenity &> /dev/null; then
+          sudo -u $GUI_USER DISPLAY=:0 XAUTHORITY=$XAUTHORITY zenity --info --title="System Upgrade" --text="$MSG" --timeout=10
+        fi
+      failed_when: false
