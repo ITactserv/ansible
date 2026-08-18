@@ -1,57 +1,522 @@
 ---
-- name: System Update, Upgrade, and Notification
-  hosts: all
-  become: yes  # Required for apt update/upgrade tasks
+################################################################################
+# System Update, Upgrade, and Multi-Channel Notification Playbook
+# Purpose: Comprehensive system patching with email + desktop notifications
+# Compatible: Ansible 2.9+, Semaphore UI
+# Author: IT Operations
+# Last Updated: August 2026
+################################################################################
 
+- name: System Update, Upgrade, and Multi-Channel Notification
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  # ============================================================================
+  # VARIABLES SECTION - Customize as needed
+  # ============================================================================
+  vars:
+    # Email notification settings (if relay available)
+    admin_email: "it-ops@actserv-africa.com"
+    mail_relay_host: "mx1.actserv-africa.com"
+    mail_relay_port: 25
+    enable_email_alerts: true
+    
+    # Notification settings
+    enable_desktop_notifications: true
+    enable_wall_broadcast: true
+    desktop_notification_timeout: 10000  # milliseconds
+    
+    # Logging settings
+    log_file: "/var/log/ansible_updates.log"
+    detailed_log_dir: "/var/log/ansible_updates"
+    
+    # Upgrade settings
+    enable_autoremove: true
+    enable_autoclean: true
+    enable_reboot_check: true
+    
+    # Performance tracking
+    start_time: "{{ ansible_date_time.iso8601 }}"
+
+  # ============================================================================
+  # TASK EXECUTION BEGINS
+  # ============================================================================
   tasks:
-    - name: Display the local Ansible version controlling this run
-      ansible.builtin.debug:
-        msg: "Control node / runner Ansible version is {{ ansible_version.full }}"
+
+    # --------------------------------------------------------------------------
+    # SECTION 1: Pre-flight Checks and System Information
+    # --------------------------------------------------------------------------
+    - name: "SECTION 1: Pre-flight Checks and System Information"
+      debug:
+        msg: "Starting system update workflow for {{ inventory_hostname }}"
       run_once: true
 
-    - name: Gather facts and display Linux OS release details
-      ansible.builtin.debug:
-        msg: "Target server {{ inventory_hostname }} is running {{ ansible_distribution }} {{ ansible_distribution_version }}"
+    - name: Display control node Ansible version
+      debug:
+        msg: "🔧 Control node Ansible version: {{ ansible_version.full }}"
+      run_once: true
 
-    - name: Update apt cache, upgrade all packages, and autoremove unused dependencies
-      ansible.builtin.apt:
-        update_cache: yes
-        upgrade: dist      # 'dist' is equivalent to 'apt-get dist-upgrade' (handles dependency changes safely)
-        autoremove: yes    # Cleans up orphaned dependencies automatically
-        autoclean: yes     # Clears out the local repository of retrieved package files
-      register: apt_upgrade_result
+    - name: Display target system information
+      debug:
+        msg: |
+          📊 Target System: {{ inventory_hostname }}
+          📦 OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          🔷 Kernel: {{ ansible_kernel }}
+          💾 Memory: {{ ansible_memtotal_mb }} MB
+          ⏰ Current time: {{ ansible_date_time.iso8601 }}
 
-    - name: Show console upgrade status
-      ansible.builtin.debug:
-        msg: >
-          {% if apt_upgrade_result.changed %}
-          System packages were successfully updated and upgraded.
-          {% else %}
-          System is already up to date. No upgrades were necessary.
-          {% endif %}
+    - name: Create detailed log directory
+      file:
+        path: "{{ detailed_log_dir }}"
+        state: directory
+        mode: '0755'
+      ignore_errors: true
 
-    - name: Notify logged-in desktop user via popup notification
-      ansible.builtin.shell: |
-        export DISPLAY=:0
-        # Locate the Xauthority file for the primary logged-in user
-        export XAUTHORITY=$(find /home/* -maxdepth 2 -name .Xauthority 2>/dev/null | head -n 1)
-        
-        # Extract the User ID of the GUI user (fallback to 1000 if not found)
-        GUI_UID=$(stat -c %u $XAUTHORITY 2>/dev/null || echo 1000)
-        export XDG_RUNTIME_DIR="/run/user/$GUI_UID"
-        GUI_USER=$(id -nu $GUI_UID)
+    - name: Check if system is running in Docker or VM
+      debug:
+        msg: "🐳 Running in container/VM environment"
+      when: ansible_virtualization_role != "host"
 
-        # Set the message based on whether packages were upgraded or not
-        if [ "{{ apt_upgrade_result.changed | lower }}" = "true" ]; then
-          MSG="Update complete! New packages were successfully installed on {{ inventory_hostname }}."
-        else
-          MSG="Update check complete. {{ inventory_hostname }} is already fully up to date."
-        fi
+    # --------------------------------------------------------------------------
+    # SECTION 2: Package Update and Upgrade (with error handling)
+    # --------------------------------------------------------------------------
+    - name: "SECTION 2: Package Update and Upgrade"
+      debug:
+        msg: "Starting package cache update and system upgrade..."
 
-        # Trigger the notification using the GUI user's DBUS session
-        if command -v notify-send &> /dev/null; then
-          sudo -u $GUI_USER DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$GUI_UID/bus" notify-send "System Upgrade" "$MSG" -i software-update-available
-        elif command -v zenity &> /dev/null; then
-          sudo -u $GUI_USER DISPLAY=:0 XAUTHORITY=$XAUTHORITY zenity --info --title="System Upgrade" --text="$MSG" --timeout=10
-        fi
-      failed_when: false
+    - name: "Package Update Block"
+      block:
+        - name: Update apt cache only (dry-run first)
+          apt:
+            update_cache: yes
+            cache_valid_time: 0
+          register: apt_cache_result
+          changed_when: false
+
+        - name: Display cache update status
+          debug:
+            msg: "✓ APT cache refreshed successfully"
+
+        - name: Upgrade all packages (dist-upgrade mode)
+          apt:
+            upgrade: dist
+            autoremove: "{{ enable_autoremove }}"
+            autoclean: "{{ enable_autoclean }}"
+          register: apt_upgrade_result
+          retries: 2
+          delay: 5
+          until: apt_upgrade_result is succeeded
+
+        - name: Capture upgrade statistics
+          set_fact:
+            packages_upgraded: "{{ apt_upgrade_result.stdout_lines | length }}"
+            upgrade_status: "success"
+            upgrade_changed: "{{ apt_upgrade_result.changed }}"
+
+        - name: Display upgrade summary
+          debug:
+            msg: |
+              ✅ UPGRADE SUCCESSFUL
+              ─────────────────────────────────────
+              Status: {{ 'Packages upgraded' if apt_upgrade_result.changed else 'System up-to-date' }}
+              Packages changed: {{ apt_upgrade_result.changed }}
+              Held packages: {{ apt_upgrade_result.held_packages | default('None') }}
+              Timestamp: {{ ansible_date_time.iso8601 }}
+
+      rescue:
+        - name: Capture upgrade error details
+          debug:
+            msg: |
+              ❌ UPGRADE FAILED
+              ─────────────────────────────────────
+              Host: {{ inventory_hostname }}
+              Error Type: {{ ansible_failed_result.msg | default('Unknown') }}
+              Stderr: {{ ansible_failed_result.stderr | default('N/A') }}
+              Stdout: {{ ansible_failed_result.stdout | default('N/A') }}
+              Timestamp: {{ ansible_date_time.iso8601 }}
+
+        - name: Set failure flags for downstream tasks
+          set_fact:
+            apt_upgrade_failed: true
+            upgrade_status: "failed"
+            apt_error_msg: "{{ ansible_failed_result.msg | default('Package upgrade failed') }}"
+            upgrade_error_details: "{{ ansible_failed_result.stderr | default('No error details available') }}"
+
+        - name: Log error to system journal
+          shell: |
+            echo "Ansible apt-get upgrade failed on {{ inventory_hostname }}: {{ apt_error_msg }}" | systemd-cat -t ansible-update -p err
+          ignore_errors: true
+
+    # --------------------------------------------------------------------------
+    # SECTION 3: Desktop Notifications
+    # --------------------------------------------------------------------------
+    - name: "SECTION 3: Desktop Notifications"
+      debug:
+        msg: "Attempting to send desktop notifications to logged-in users..."
+      when: enable_desktop_notifications
+
+    - name: "Desktop Notification Block"
+      block:
+        - name: Detect logged-in X11 sessions
+          shell: |
+            ps aux | grep -E 'X|wayland' | grep -v grep | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/ && $(i+1) ~ /^[Xx]/) print $1}' | sort -u
+          register: display_users
+          changed_when: false
+          failed_when: false
+
+        - name: Send desktop notifications to all logged-in users
+          shell: |
+            set -e
+            export DISPLAY=:0
+            
+            # Locate the Xauthority file for the primary logged-in user
+            XAUTH_FILE=$(find /home/* -maxdepth 2 -name .Xauthority 2>/dev/null | head -n 1)
+            
+            if [ -z "$XAUTH_FILE" ]; then
+              echo "WARNING: No .Xauthority file found. Skipping GUI notification." >&2
+              exit 0
+            fi
+            
+            export XAUTHORITY="$XAUTH_FILE"
+            GUI_UID=$(stat -c %u "$XAUTHORITY" 2>/dev/null)
+            
+            if [ -z "$GUI_UID" ]; then
+              echo "WARNING: Failed to determine GUI user ID" >&2
+              exit 0
+            fi
+            
+            export XDG_RUNTIME_DIR="/run/user/$GUI_UID"
+            GUI_USER=$(id -nu $GUI_UID 2>/dev/null)
+            
+            if [ -z "$GUI_USER" ]; then
+              echo "WARNING: Failed to resolve GUI username for UID $GUI_UID" >&2
+              exit 0
+            fi
+            
+            # Determine notification message based on upgrade outcome
+            {% if apt_upgrade_failed | default(false) %}
+              MSG="⚠️  ALERT: System update FAILED on {{ inventory_hostname }}"
+              DETAILS="{{ apt_error_msg }}"
+              ICON="software-update-urgent"
+              URGENCY="critical"
+            {% elif upgrade_changed | default(false) %}
+              MSG="✅ Success: System update completed on {{ inventory_hostname }}"
+              DETAILS="Packages were upgraded successfully"
+              ICON="software-update-available"
+              URGENCY="normal"
+            {% else %}
+              MSG="ℹ️  Info: {{ inventory_hostname }} is already up-to-date"
+              DETAILS="No package updates available"
+              ICON="dialog-information"
+              URGENCY="low"
+            {% endif %}
+            
+            # Try notify-send first (preferred for modern desktops)
+            if command -v notify-send &> /dev/null; then
+              sudo -u "$GUI_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus" \
+                notify-send \
+                  --app-name="Ansible System Update" \
+                  --urgency="$URGENCY" \
+                  --expire-time="{{ desktop_notification_timeout }}" \
+                  --icon="$ICON" \
+                  "$MSG" "$DETAILS"
+              echo "✓ Notification sent via notify-send to $GUI_USER"
+            
+            # Fallback to zenity if notify-send unavailable
+            elif command -v zenity &> /dev/null; then
+              sudo -u "$GUI_USER" DISPLAY=:0 XAUTHORITY="$XAUTHORITY" \
+                zenity --info \
+                  --title="Ansible System Update" \
+                  --text="$MSG\n\n$DETAILS" \
+                  --timeout=10
+              echo "✓ Notification sent via zenity to $GUI_USER"
+            
+            else
+              echo "INFO: Neither notify-send nor zenity available" >&2
+              exit 0
+            fi
+          register: notification_result
+          changed_when: false
+          failed_when: false
+          when: enable_desktop_notifications | bool
+
+        - name: Display notification status
+          debug:
+            msg: "✓ Desktop notifications processed (see output above for details)"
+          when: enable_desktop_notifications | bool
+
+      rescue:
+        - name: Log desktop notification failure (non-critical)
+          debug:
+            msg: |
+              ⚠️  Desktop notification delivery failed on {{ inventory_hostname }}
+              Error: {{ ansible_failed_result.stderr | default('Unknown error') }}
+              Status: Continuing workflow (notification failure is non-critical)
+
+    # --------------------------------------------------------------------------
+    # SECTION 4: Wall Broadcast Notification
+    # --------------------------------------------------------------------------
+    - name: "SECTION 4: Wall Broadcast Notification"
+      debug:
+        msg: "Broadcasting update status to all logged-in users..."
+      when: enable_wall_broadcast
+
+    - name: "Wall Broadcast Block"
+      block:
+        - name: Create wall broadcast message
+          set_fact:
+            wall_message: |
+              ╔════════════════════════════════════════════════════════════╗
+              ║         SYSTEM UPDATE NOTIFICATION - {{ inventory_hostname }}
+              ╠════════════════════════════════════════════════════════════╣
+              {% if apt_upgrade_failed | default(false) %}
+              ║  ❌ Status: UPGRADE FAILED
+              ║  Error: {{ apt_error_msg }}
+              {% elif upgrade_changed | default(false) %}
+              ║  ✅ Status: UPGRADE SUCCESSFUL
+              ║  Action: Packages have been updated
+              {% else %}
+              ║  ℹ️  Status: UP-TO-DATE
+              ║  Action: No updates available
+              {% endif %}
+              ║
+              ║  Time: {{ ansible_date_time.iso8601 }}
+              ║  Initiated by: Ansible/Semaphore
+              ╚════════════════════════════════════════════════════════════╝
+
+        - name: Broadcast to all terminals
+          shell: "echo '{{ wall_message }}' | wall"
+          ignore_errors: true
+          when: enable_wall_broadcast | bool
+
+      rescue:
+        - name: Log wall broadcast failure (non-critical)
+          debug:
+            msg: "⚠️  Wall broadcast failed (non-critical)"
+
+    # --------------------------------------------------------------------------
+    # SECTION 5: Email Notifications for Admins
+    # --------------------------------------------------------------------------
+    - name: "SECTION 5: Email Notifications for Admins"
+      debug:
+        msg: "Preparing email alert for IT administrators..."
+      when: enable_email_alerts
+
+    - name: "Email Alert Block"
+      block:
+        - name: Create email alert body
+          set_fact:
+            email_body: |
+              System Update Report - {{ inventory_hostname }}
+              ═══════════════════════════════════════════════════
+              
+              Timestamp: {{ ansible_date_time.iso8601 }}
+              Host: {{ inventory_hostname }}
+              
+              UPDATE STATUS
+              ─────────────
+              {% if apt_upgrade_failed | default(false) %}
+              Status: ❌ FAILED
+              Reason: {{ apt_error_msg }}
+              Details: {{ upgrade_error_details | default('N/A') }}
+              Action Required: Manual investigation recommended
+              {% elif upgrade_changed | default(false) %}
+              Status: ✅ SUCCESSFUL
+              Action: Packages upgraded successfully
+              Reboot Required: {% if reboot_required | default(false) %}YES{% else %}NO{% endif %}
+              {% else %}
+              Status: ℹ️  UP-TO-DATE
+              Action: No package updates available
+              {% endif %}
+              
+              SYSTEM INFORMATION
+              ──────────────────
+              Operating System: {{ ansible_distribution }} {{ ansible_distribution_version }}
+              Kernel: {{ ansible_kernel }}
+              Memory: {{ ansible_memtotal_mb }} MB
+              Uptime: {{ ansible_uptime_seconds | int // 3600 }} hours
+              
+              UPGRADE DETAILS
+              ───────────────
+              Autoremove Enabled: {{ enable_autoremove }}
+              Autoclean Enabled: {{ enable_autoclean }}
+              
+              This is an automated report from your Ansible/Semaphore infrastructure.
+              
+              ═══════════════════════════════════════════════════
+
+        - name: Send email alert via postfix
+          shell: |
+            cat << 'EOF' | /usr/sbin/sendmail -t
+            To: {{ admin_email }}
+            From: ansible@{{ inventory_hostname }}
+            Subject: [{{ 'FAILED' if apt_upgrade_failed | default(false) else 'SUCCESS' }}] System Update - {{ inventory_hostname }}
+            Content-Type: text/plain; charset=UTF-8
+            
+            {{ email_body }}
+            EOF
+          register: email_result
+          changed_when: false
+          failed_when: false
+          when: enable_email_alerts | bool and ansible_os_family == "Debian"
+
+        - name: Display email send status
+          debug:
+            msg: |
+              Email alert sent to: {{ admin_email }}
+              Status: {{ 'Sent' if email_result.rc == 0 else 'Failed (sendmail not available)' }}
+          when: enable_email_alerts | bool
+
+      rescue:
+        - name: Log email failure (non-critical)
+          debug:
+            msg: |
+              ⚠️  Email notification failed on {{ inventory_hostname }}
+              Error: {{ ansible_failed_result.msg | default('Sendmail not available or configuration error') }}
+              Status: Continuing workflow (email failure is non-critical)
+
+    # --------------------------------------------------------------------------
+    # SECTION 6: Kernel and Reboot Detection
+    # --------------------------------------------------------------------------
+    - name: "SECTION 6: Kernel and Reboot Detection"
+      debug:
+        msg: "Checking if system reboot is required..."
+      when: enable_reboot_check
+
+    - name: "Reboot Check Block"
+      block:
+        - name: Check for reboot requirement flag
+          stat:
+            path: /var/run/reboot-required
+          register: reboot_required_file
+          changed_when: false
+
+        - name: Detect installed vs running kernel version
+          shell: |
+            INSTALLED=$(dpkg -l | grep linux-image | grep "ii" | awk '{print $2}' | tail -1)
+            RUNNING=$(uname -r)
+            if [ "$INSTALLED" != "$RUNNING" ]; then
+              echo "kernel-mismatch"
+              exit 0
+            fi
+          register: kernel_check
+          changed_when: false
+          failed_when: false
+
+        - name: Set reboot required flag
+          set_fact:
+            reboot_required: "{{ reboot_required_file.stat.exists or 'kernel-mismatch' in kernel_check.stdout }}"
+
+        - name: Alert if reboot is required
+          debug:
+            msg: |
+              ⚠️  REBOOT REQUIRED
+              ─────────────────────────────────────
+              Host: {{ inventory_hostname }}
+              Reason: {{ 'Kernel update detected' if 'kernel-mismatch' in kernel_check.stdout else 'System update flag set' }}
+              Running Kernel: {{ ansible_kernel }}
+              Action: Schedule a reboot at your earliest convenience
+              Command: sudo reboot
+          when: reboot_required | bool
+
+      rescue:
+        - name: Log reboot check failure (non-critical)
+          debug:
+            msg: "⚠️  Reboot check failed - please verify manually on {{ inventory_hostname }}"
+
+    # --------------------------------------------------------------------------
+    # SECTION 7: Comprehensive Logging
+    # --------------------------------------------------------------------------
+    - name: "SECTION 7: Comprehensive Logging"
+      debug:
+        msg: "Logging update results to system log..."
+
+    - name: "Logging Block"
+      block:
+        - name: Create structured log entry
+          set_fact:
+            log_entry: |
+              [{{ ansible_date_time.iso8601 }}] UPDATE_REPORT
+              Host: {{ inventory_hostname }}
+              Status: {{ upgrade_status | upper }}
+              Reboot_Required: {{ reboot_required | default(false) }}
+              Packages_Changed: {{ apt_upgrade_result.changed | default(false) }}
+              Desktop_Notifications: {{ 'success' if notification_result.rc == 0 else 'failed (non-critical)' if notification_result is defined else 'skipped' }}
+              Email_Alert: {{ 'success' if email_result.rc == 0 else 'failed' if email_result is defined else 'skipped' }}
+              Error_Message: {{ apt_error_msg | default('None') }}
+              ─────────────────────────────────────
+
+        - name: Write to main log file
+          lineinfile:
+            path: "{{ log_file }}"
+            line: "{{ log_entry }}"
+            create: yes
+            mode: '0644'
+          ignore_errors: true
+
+        - name: Write detailed log to dated file
+          copy:
+            content: |
+              ═══════════════════════════════════════════════════════════
+              ANSIBLE SYSTEM UPDATE - DETAILED LOG
+              ═══════════════════════════════════════════════════════════
+              
+              Execution Time: {{ ansible_date_time.iso8601 }}
+              Target Host: {{ inventory_hostname }}
+              Control Node: {{ inventory_hostname }}
+              Ansible Version: {{ ansible_version.full }}
+              
+              UPGRADE RESULTS
+              ───────────────
+              Status: {{ upgrade_status | upper }}
+              Packages Changed: {{ apt_upgrade_result.changed | default('Unknown') }}
+              {% if apt_upgrade_failed | default(false) %}
+              Error: {{ apt_error_msg }}
+              Details: {{ upgrade_error_details | default('N/A') }}
+              {% endif %}
+              
+              SYSTEM STATE
+              ────────────
+              OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+              Kernel: {{ ansible_kernel }}
+              Memory: {{ ansible_memtotal_mb }} MB
+              Reboot Required: {{ reboot_required | default(false) }}
+              
+              NOTIFICATIONS
+              ─────────────
+              Desktop: {{ 'Sent' if (notification_result.rc == 0 if notification_result is defined else false) else 'Failed or Skipped' }}
+              Email: {{ 'Sent' if (email_result.rc == 0 if email_result is defined else false) else 'Failed or Skipped' }}
+              
+              ═══════════════════════════════════════════════════════════
+            dest: "{{ detailed_log_dir }}/update-{{ inventory_hostname }}-{{ ansible_date_time.date }}.log"
+            mode: '0644'
+          ignore_errors: true
+
+      rescue:
+        - name: Log logging failure (non-critical)
+          debug:
+            msg: "⚠️  Logging failed (non-critical) - update execution may still have succeeded"
+
+    # --------------------------------------------------------------------------
+    # SECTION 8: Final Summary Report
+    # --------------------------------------------------------------------------
+    - name: "SECTION 8: Final Summary Report"
+      debug:
+        msg: |
+          
+          ╔════════════════════════════════════════════════════════════╗
+          ║           SYSTEM UPDATE EXECUTION SUMMARY
+          ╠════════════════════════════════════════════════════════════╣
+          ║  Host: {{ inventory_hostname }}
+          ║  Status: {{ upgrade_status | upper }}
+          ║  Time: {{ ansible_date_time.iso8601 }}
+          ║
+          ║  📦 Package Update: {{ 'DONE' if upgrade_changed | default(false) else 'UP-TO-DATE' }}
+          ║  📧 Email Alert: {{ 'SENT' if (email_result.rc == 0 if email_result is defined else false) else 'SKIPPED' }}
+          ║  🖥️  Desktop Notif: {{ 'SENT' if (notification_result.rc == 0 if notification_result is defined else false) else 'SKIPPED' }}
+          ║  ⚠️  Reboot Needed: {{ 'YES' if reboot_required | default(false) else 'NO' }}
+          ║
+          ║  Log File: {{ log_file }}
+          ║  Detailed Log: {{ detailed_log_dir }}/update-{{ inventory_hostname }}-{{ ansible_date_time.date }}.log
+          ╚════════════════════════════════════════════════════════════╝
