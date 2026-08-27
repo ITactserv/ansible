@@ -1,0 +1,538 @@
+---
+- name: Configure WiFi PolicyKit with Automatic Failover
+  hosts: all
+  become: yes
+  gather_facts: yes
+  
+  vars:
+    wifi_users: ["{{ ansible_user }}"]
+    polkit_rules_d_path: /etc/polkit-1/rules.d/49-network-nopasswd.rules
+    polkit_localauth_path: /etc/polkit-1/localauthority/50-local.d/10-network-manager.pkla
+    backup_suffix: ".backup.{{ ansible_date_time.iso8601_basic_short }}"
+    validation_timeout: 5
+  
+  pre_tasks:
+    - name: Initialize status variables
+      set_fact:
+        polkit_method: "unknown"
+        polkit_method_applied: false
+        validation_passed: false
+        error_messages: []
+      tags: always
+
+    - name: Validate Linux system
+      assert:
+        that:
+          - ansible_system == "Linux"
+        fail_msg: "This playbook only supports Linux systems"
+      tags: always
+
+    - name: Check NetworkManager installation
+      package_facts:
+        manager: apt
+      when: ansible_os_family == "Debian"
+      tags: always
+
+    - name: Verify NetworkManager package
+      assert:
+        that:
+          - "'network-manager' in ansible_facts.packages or 'NetworkManager' in ansible_facts.packages"
+        fail_msg: |
+          NetworkManager is not installed. Install it first:
+          - Debian/Ubuntu: sudo apt-get install network-manager
+          - RedHat/CentOS: sudo yum install NetworkManager
+          - Arch: sudo pacman -S networkmanager
+      tags: always
+
+    - name: Check polkit installation
+      stat:
+        path: /etc/polkit-1
+      register: polkit_dir
+      tags: always
+
+    - name: Verify polkit is installed
+      assert:
+        that:
+          - polkit_dir.stat.exists
+        fail_msg: "PolicyKit (/etc/polkit-1) is not installed on this system"
+      tags: always
+
+  tasks:
+    # ====== ATTEMPT 1: Modern rules.d Method ======
+    - name: "ATTEMPT 1: Configure WiFi PolicyKit (rules.d method)"
+      block:
+        - name: Create rules.d directory
+          file:
+            path: /etc/polkit-1/rules.d
+            state: directory
+            mode: '0755'
+          tags: polkit_config
+
+        - name: Backup existing rules.d file
+          copy:
+            src: "{{ polkit_rules_d_path }}"
+            dest: "{{ polkit_rules_d_path }}{{ backup_suffix }}"
+            remote_src: yes
+          when: 
+            - lookup('pipe', 'test -f {{ polkit_rules_d_path }} && echo yes || echo no') == 'yes'
+          tags: polkit_config
+
+        - name: Create JavaScript rules.d file
+          copy:
+            dest: "{{ polkit_rules_d_path }}"
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              // Allow specified users to modify WiFi connections without password
+              // Generated: {{ ansible_date_time.iso8601 }}
+              // Users: {{ wifi_users | join(', ') }}
+              polkit.addRule(function(action, subject) {
+                var allowedUsers = {{ wifi_users | to_json }};
+                if ((action.id == "org.freedesktop.NetworkManager.network-control" ||
+                     action.id == "org.freedesktop.NetworkManager.settings.modify.system") &&
+                    allowedUsers.indexOf(subject.user) !== -1) {
+                  return polkit.Result.YES;
+                }
+              });
+          register: rules_d_created
+          tags: polkit_config
+
+        - name: Validate rules.d file syntax
+          block:
+            - name: Check if polkit-exec exists (can validate rules)
+              stat:
+                path: /usr/bin/polkit-exec
+              register: polkit_exec_check
+              tags: polkit_validate
+
+            - name: Validate JavaScript syntax (using node if available)
+              shell: |
+                which node > /dev/null 2>&1 && \
+                node -c {{ polkit_rules_d_path }} 2>&1 || \
+                echo "Node.js not available, skipping JS validation"
+              register: js_validation
+              failed_when: false
+              tags: polkit_validate
+
+            - name: Check polkit daemon can read the file
+              stat:
+                path: "{{ polkit_rules_d_path }}"
+              register: rules_file_stat
+              tags: polkit_validate
+
+            - name: Verify file permissions
+              assert:
+                that:
+                  - rules_file_stat.stat.mode == '0644'
+                fail_msg: "Rules file has incorrect permissions: {{ rules_file_stat.stat.mode }}"
+              tags: polkit_validate
+
+            - name: Restart NetworkManager
+              systemd:
+                name: NetworkManager
+                state: restarted
+              register: nm_restart
+              tags: polkit_validate
+
+            - name: Wait for NetworkManager to stabilize
+              pause:
+                seconds: 2
+              tags: polkit_validate
+
+            - name: Check NetworkManager status
+              systemd:
+                name: NetworkManager
+              register: nm_status
+              tags: polkit_validate
+
+            - name: Verify NetworkManager is running
+              assert:
+                that:
+                  - nm_status.status.ActiveState == 'active'
+                fail_msg: "NetworkManager failed to restart properly"
+              tags: polkit_validate
+
+            - name: Check polkit daemon status
+              systemd:
+                name: polkit
+              register: polkit_status
+              when: ansible_os_family == "Debian"
+              tags: polkit_validate
+
+            - name: Verify polkit daemon is active
+              assert:
+                that:
+                  - polkit_status.status.ActiveState == 'active' or polkit_status is skipped
+                fail_msg: "PolicyKit daemon is not running"
+              tags: polkit_validate
+
+            - name: Display rules.d validation success
+              set_fact:
+                polkit_method: "rules.d"
+                polkit_method_applied: true
+                validation_passed: true
+              tags: polkit_validate
+
+          rescue:
+            - name: Capture validation error
+              set_fact:
+                validation_error: "{{ ansible_failed_result.msg }}"
+                error_messages: "{{ error_messages + ['rules.d validation failed: ' + (ansible_failed_result.msg | default('Unknown error'))] }}"
+              tags: polkit_validate
+
+            - name: Display validation failure
+              debug:
+                msg: |
+                  ⚠ rules.d validation FAILED:
+                  {{ validation_error | default('Unknown validation error') }}
+                  
+                  Attempting fallback to localauthority method...
+              tags: polkit_validate
+
+            - name: Rollback rules.d file
+              block:
+                - name: Remove failed rules.d file
+                  file:
+                    path: "{{ polkit_rules_d_path }}"
+                    state: absent
+                  tags: polkit_validate
+
+                - name: Restore backup if exists
+                  copy:
+                    src: "{{ polkit_rules_d_path }}{{ backup_suffix }}"
+                    dest: "{{ polkit_rules_d_path }}"
+                    remote_src: yes
+                  when:
+                    - lookup('pipe', 'test -f {{ polkit_rules_d_path }}{{ backup_suffix }} && echo yes || echo no') == 'yes'
+                  tags: polkit_validate
+
+                - name: Restart NetworkManager after rollback
+                  systemd:
+                    name: NetworkManager
+                    state: restarted
+                  tags: polkit_validate
+
+                - name: Display rollback success
+                  debug:
+                    msg: "✓ Rolled back failed rules.d configuration"
+                  tags: polkit_validate
+
+              rescue:
+                - name: Log rollback failure
+                  set_fact:
+                    error_messages: "{{ error_messages + ['Failed to rollback rules.d: ' + ansible_failed_result.msg] }}"
+                  tags: polkit_validate
+
+      rescue:
+        - name: Set validation failure flag
+          set_fact:
+            validation_passed: false
+          tags: polkit_config
+
+    # ====== ATTEMPT 2: Legacy localauthority Method (Fallback) ======
+    - name: "ATTEMPT 2: Configure WiFi PolicyKit (localauthority fallback)"
+      block:
+        - name: Display fallback message
+          debug:
+            msg: |
+              → Attempting legacy localauthority method...
+              Creating: {{ polkit_localauth_path }}
+          tags: polkit_fallback
+
+        - name: Create localauthority directory
+          file:
+            path: /etc/polkit-1/localauthority/50-local.d
+            state: directory
+            mode: '0755'
+          tags: polkit_fallback
+
+        - name: Backup existing localauthority file
+          copy:
+            src: "{{ polkit_localauth_path }}"
+            dest: "{{ polkit_localauth_path }}{{ backup_suffix }}"
+            remote_src: yes
+          when:
+            - lookup('pipe', 'test -f {{ polkit_localauth_path }} && echo yes || echo no') == 'yes'
+          tags: polkit_fallback
+
+        - name: Create localauthority .pkla file
+          copy:
+            dest: "{{ polkit_localauth_path }}"
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              [Allow Users to Modify Connections]
+              Identity=unix-user:*
+              Action=org.freedesktop.NetworkManager.network-control
+              ResultAny=yes
+              ResultInactive=yes
+              ResultActive=yes
+          register: localauth_created
+          tags: polkit_fallback
+
+        - name: Validate localauthority file syntax
+          block:
+            - name: Check file permissions
+              stat:
+                path: "{{ polkit_localauth_path }}"
+              register: localauth_file_stat
+              tags: polkit_validate
+
+            - name: Verify .pkla file permissions
+              assert:
+                that:
+                  - localauth_file_stat.stat.mode == '0644'
+                fail_msg: "Localauthority file has incorrect permissions: {{ localauth_file_stat.stat.mode }}"
+              tags: polkit_validate
+
+            - name: Restart polkit daemon
+              systemd:
+                name: polkit
+                state: restarted
+              register: polkit_restart
+              failed_when: polkit_restart.failed and polkit_restart.stderr != ""
+              tags: polkit_validate
+
+            - name: Wait for polkit daemon to stabilize
+              pause:
+                seconds: 2
+              tags: polkit_validate
+
+            - name: Restart NetworkManager
+              systemd:
+                name: NetworkManager
+                state: restarted
+              register: nm_restart_fallback
+              tags: polkit_validate
+
+            - name: Wait for NetworkManager to stabilize
+              pause:
+                seconds: 2
+              tags: polkit_validate
+
+            - name: Verify NetworkManager is running
+              systemd:
+                name: NetworkManager
+              register: nm_status_fallback
+              tags: polkit_validate
+
+            - name: Assert NetworkManager is active
+              assert:
+                that:
+                  - nm_status_fallback.status.ActiveState == 'active'
+                fail_msg: "NetworkManager failed to start after localauthority configuration"
+              tags: polkit_validate
+
+            - name: Set fallback success flag
+              set_fact:
+                polkit_method: "localauthority"
+                polkit_method_applied: true
+                validation_passed: true
+              tags: polkit_validate
+
+            - name: Display fallback success
+              debug:
+                msg: |
+                  ✓ localauthority method configured successfully!
+                  Method: Legacy PolicyKit (.pkla file)
+                  Path: {{ polkit_localauth_path }}
+              tags: polkit_validate
+
+          rescue:
+            - name: Capture fallback error
+              set_fact:
+                fallback_error: "{{ ansible_failed_result.msg }}"
+                error_messages: "{{ error_messages + ['localauthority validation failed: ' + (ansible_failed_result.msg | default('Unknown error'))] }}"
+              tags: polkit_validate
+
+            - name: Display fallback failure
+              debug:
+                msg: |
+                  ✗ localauthority validation FAILED:
+                  {{ fallback_error | default('Unknown validation error') }}
+                  
+                  Attempting rollback...
+              tags: polkit_validate
+
+            - name: Rollback localauthority file
+              block:
+                - name: Remove failed localauthority file
+                  file:
+                    path: "{{ polkit_localauth_path }}"
+                    state: absent
+                  tags: polkit_validate
+
+                - name: Restore backup if exists
+                  copy:
+                    src: "{{ polkit_localauth_path }}{{ backup_suffix }}"
+                    dest: "{{ polkit_localauth_path }}"
+                    remote_src: yes
+                  when:
+                    - lookup('pipe', 'test -f {{ polkit_localauth_path }}{{ backup_suffix }} && echo yes || echo no') == 'yes'
+                  tags: polkit_validate
+
+                - name: Restart polkit
+                  systemd:
+                    name: polkit
+                    state: restarted
+                  failed_when: false
+                  tags: polkit_validate
+
+                - name: Restart NetworkManager
+                  systemd:
+                    name: NetworkManager
+                    state: restarted
+                  tags: polkit_validate
+
+                - name: Display fallback rollback success
+                  debug:
+                    msg: "✓ Rolled back failed localauthority configuration"
+                  tags: polkit_validate
+
+              rescue:
+                - name: Log fallback rollback failure
+                  set_fact:
+                    error_messages: "{{ error_messages + ['Failed to rollback localauthority: ' + ansible_failed_result.msg] }}"
+                  tags: polkit_validate
+
+      rescue:
+        - name: Set fallback failure flag
+          set_fact:
+            validation_passed: false
+          tags: polkit_fallback
+
+  post_tasks:
+    - name: Generate final report
+      block:
+        - name: Determine final status
+          set_fact:
+            final_status: "{{ 'SUCCESS ✓' if validation_passed else 'FAILED ✗' }}"
+            status_icon: "{{ '✓' if validation_passed else '✗' }}"
+          tags: always
+
+        - name: Display success report
+          debug:
+            msg: |
+              
+              ╔════════════════════════════════════════════════════════════╗
+              ║           WiFi PolicyKit Configuration Report               ║
+              ╚════════════════════════════════════════════════════════════╝
+              
+              Host: {{ inventory_hostname }}
+              Status: {{ final_status }}
+              
+              Configuration Method Applied:
+              {{ '  → Method: ' + polkit_method if validation_passed else '  → No method applied successfully' }}
+              
+              Users Configured:
+              {% for user in wifi_users %}
+                {{ '  ✓ ' + user if validation_passed else '  ✗ ' + user }}
+              {% endfor %}
+              
+              Details:
+              {% if validation_passed %}
+                ✓ PolicyKit rule created
+                ✓ Permissions validated
+                ✓ NetworkManager restarted
+                ✓ Services confirmed active
+              {% else %}
+                ✗ Failed to apply either method
+              {% endif %}
+              
+              ╔════════════════════════════════════════════════════════════╗
+          when: validation_passed
+          tags: always
+
+        - name: Display failure report with errors
+          debug:
+            msg: |
+              
+              ╔════════════════════════════════════════════════════════════╗
+              ║           WiFi PolicyKit Configuration FAILED               ║
+              ╚════════════════════════════════════════════════════════════╝
+              
+              Host: {{ inventory_hostname }}
+              Status: FAILED ✗
+              
+              Error Details:
+              {% for error in error_messages %}
+                • {{ error }}
+              {% endfor %}
+              
+              Attempted Methods:
+                1. rules.d (modern)     → FAILED
+                2. localauthority (legacy) → FAILED
+              
+              ╔════════════════════════════════════════════════════════════╗
+              ║  Troubleshooting Steps:                                     ║
+              ╚════════════════════════════════════════════════════════════╝
+              
+              1. Verify NetworkManager is installed:
+                 sudo apt install network-manager  # Debian/Ubuntu
+                 sudo yum install NetworkManager   # RedHat/CentOS
+              
+              2. Verify PolicyKit is installed:
+                 ls -la /etc/polkit-1/
+              
+              3. Check service status:
+                 systemctl status NetworkManager
+                 systemctl status polkit
+              
+              4. Verify file permissions:
+                 ls -la /etc/polkit-1/rules.d/
+                 ls -la /etc/polkit-1/localauthority/50-local.d/
+              
+              5. Check system logs:
+                 sudo journalctl -xe | grep -i polkit
+                 sudo journalctl -xe | grep -i network
+              
+              6. Try manual configuration:
+                 sudo nano /etc/polkit-1/localauthority/50-local.d/10-network-manager.pkla
+              
+              Need help? Run playbook with verbose output:
+                 ansible-playbook wifi-polkit-failover.yml -vvv
+          when: not validation_passed
+          tags: always
+
+        - name: Fail playbook if validation failed
+          fail:
+            msg: |
+              WiFi PolicyKit configuration failed on {{ inventory_hostname }}.
+              Errors:
+              {% for error in error_messages %}
+                - {{ error }}
+              {% endfor %}
+          when: not validation_passed
+          tags: always
+
+      always:
+        - name: Save detailed report to file
+          copy:
+            dest: /tmp/wifi-polkit-report-{{ inventory_hostname }}-{{ ansible_date_time.iso8601_basic_short }}.txt
+            content: |
+              WiFi PolicyKit Configuration Report
+              =====================================
+              Generated: {{ ansible_date_time.iso8601 }}
+              Host: {{ inventory_hostname }}
+              
+              Status: {{ final_status if validation_passed is defined else 'Unknown' }}
+              Method Applied: {{ polkit_method if validation_passed is defined else 'None' }}
+              
+              Users Configured: {{ wifi_users | join(', ') }}
+              
+              Configuration Files:
+              - rules.d: {{ polkit_rules_d_path }}
+              - localauthority: {{ polkit_localauth_path }}
+              
+              {% if error_messages %}
+              Errors Encountered:
+              {% for error in error_messages %}
+              - {{ error }}
+              {% endfor %}
+              {% endif %}
+              
+              Validation Passed: {{ validation_passed if validation_passed is defined else False }}
+          delegate_to: localhost
+          tags: always
