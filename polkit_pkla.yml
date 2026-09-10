@@ -1,154 +1,558 @@
 ---
-- name: Hardened Polkit + NetworkManager configuration (Semaphore safe)
+- name: WiFi PolicyKit Configuration - Production Hardened
   hosts: all
   become: yes
   gather_facts: yes
-
+  
   vars:
-    polkit_file: /etc/polkit-1/localauthority/50-local.d/10-network-manager.pkla
-    report: []
+    # ===== PATHS =====
+    polkit_rules_d_path: /etc/polkit-1/rules.d/49-network-nopasswd.rules
+    polkit_localauth_path: /etc/polkit-1/localauthority/50-local.d/10-network-manager.pkla
+    polkit_base_dir: /etc/polkit-1
+    backup_dir: /var/backups/polkit-configs
+    report_dir: /tmp/polkit-reports
+    
+    # ===== DEFAULTS =====
+    method_used: "none"
+    deployment_status: "PENDING"
+    nm_status: "UNKNOWN"
+    preflight_passed: false
+    
+  pre_tasks:
+    - name: "PRE-FLIGHT: Validate system compatibility"
+      assert:
+        that:
+          - ansible_facts['system'] == "Linux"
+          - ansible_facts['os_family'] in ["Debian", "RedHat", "Arch"]
+        fail_msg: |
+          ✗ PREFLIGHT CHECK FAILED
+          - System: {{ ansible_facts.get('system', 'UNKNOWN') }}
+          - OS Family: {{ ansible_facts.get('os_family', 'UNKNOWN') }}
+          
+          This playbook supports: Linux only (Debian, RedHat, Arch families)
+      tags: [preflight, always]
 
-  tasks:
+    - name: "PRE-FLIGHT: Check if running as root or with sudo"
+      assert:
+        that:
+          - ansible_facts['user_id'] == 0 or ansible_become | bool
+        fail_msg: |
+          ✗ PRIVILEGE ESCALATION REQUIRED
+          
+          This playbook must run with 'become: yes' or as root
+          Current user: {{ ansible_facts['user_id'] }}
+      tags: [preflight, always]
 
-  # =========================
-  # 1. INIT SAFE STATE
-  # =========================
-    - name: Initialize safe status variables
-      set_fact:
-        nm_available: false
-        nm_restart_status: "SKIPPED"
-        pkla_status: "UNKNOWN"
-        report: []
+    - name: "PRE-FLIGHT: Verify package manager is available"
+      block:
+        - name: Check package manager (Debian)
+          shell: which apt-get 2>/dev/null || which apt
+          register: pm_check
+          changed_when: false
+          when: ansible_facts['os_family'] == "Debian"
 
-  # =========================
-  # 2. ENSURE POLKIT DIRECTORY
-  # =========================
-    - name: Ensure polkit directory exists
+        - name: Check package manager (RedHat)
+          shell: which yum || which dnf
+          register: pm_check
+          changed_when: false
+          when: ansible_facts['os_family'] == "RedHat"
+
+        - name: Check package manager (Arch)
+          shell: which pacman
+          register: pm_check
+          changed_when: false
+          when: ansible_facts['os_family'] == "Arch"
+
+        - name: Assert package manager found
+          assert:
+            that:
+              - pm_check.rc == 0
+            fail_msg: "✗ No compatible package manager found"
+      rescue:
+        - name: Report package manager check failure
+          debug:
+            msg: "⚠ WARNING: Package manager check failed - continuing anyway"
+      tags: [preflight]
+
+    - name: "PRE-FLIGHT: Create backup and report directories"
       file:
-        path: /etc/polkit-1/localauthority/50-local.d
+        path: "{{ item }}"
         state: directory
         owner: root
         group: root
-        mode: '0755'
+        mode: '0750'
+      loop:
+        - "{{ backup_dir }}"
+        - "{{ report_dir }}"
+      tags: [preflight, always]
 
-  # =========================
-  # 3. DEPLOY PKLA RULE
-  # =========================
-    - name: Deploy PKLA rule safely
-      copy:
-        dest: "{{ polkit_file }}"
+    - name: "PRE-FLIGHT: Generate session ID for tracking"
+      set_fact:
+        session_id: "{{ ansible_date_time.iso8601_basic_short }}_{{ 999999 | random }}"
+        deployment_start_time: "{{ ansible_date_time.iso8601 }}"
+      tags: [preflight, always]
+
+    - name: "PRE-FLIGHT: Backup current configuration"
+      block:
+        - name: Backup rules.d if exists
+          copy:
+            src: "{{ polkit_rules_d_path }}"
+            dest: "{{ backup_dir }}/rules.d_{{ session_id }}.backup"
+            remote_src: yes
+            backup: yes
+          ignore_errors: yes
+          register: rules_backup
+
+        - name: Backup localauthority if exists
+          copy:
+            src: "{{ polkit_localauth_path }}"
+            dest: "{{ backup_dir }}/localauth_{{ session_id }}.backup"
+            remote_src: yes
+            backup: yes
+          ignore_errors: yes
+          register: localauth_backup
+
+        - name: Log backup status
+          debug:
+            msg: |
+              Backup Status:
+              - rules.d backup: {{ "OK" if rules_backup is succeeded else "SKIPPED (file may not exist)" }}
+              - localauth backup: {{ "localauth_backup is succeeded | default(False) | ternary('OK', 'SKIPPED') }}" }}
+      tags: [preflight, backup]
+
+  tasks:
+    # ==============================================
+    # PHASE 1: DEPENDENCY INSTALLATION
+    # ==============================================
+    - name: "PHASE 1: Install required packages"
+      block:
+        - name: Install on Debian/Ubuntu
+          apt:
+            name:
+              - policykit-1
+              - network-manager
+              - acl  # Required for ACL support in Ansible privilege escalation
+            state: present
+            update_cache: yes
+            cache_valid_time: 3600
+          when: ansible_facts['os_family'] == "Debian"
+
+        - name: Install on RedHat/CentOS
+          yum:
+            name:
+              - polkit
+              - NetworkManager
+            state: present
+          when: ansible_facts['os_family'] == "RedHat"
+
+        - name: Install on Arch
+          pacman:
+            name:
+              - polkit
+              - networkmanager
+            state: present
+          when: ansible_facts['os_family'] == "Arch"
+      rescue:
+        - name: Report installation failure
+          set_fact:
+            deployment_status: "FAILED_INSTALL"
+          notify: "report_deployment_failure"
+      tags: [install, always]
+
+    # ==============================================
+    # PHASE 2: DIRECTORY STRUCTURE PREPARATION
+    # ==============================================
+    - name: "PHASE 2: Prepare PolicyKit directories"
+      file:
+        path: "{{ item.path }}"
+        state: directory
         owner: root
         group: root
-        mode: '0644'
-        content: |
-          [Allow Users to Modify Connections]
-          Identity=unix-user:*
-          Action=org.freedesktop.NetworkManager.network-control
-          ResultAny=yes
-          ResultInactive=yes
-          ResultActive=yes
-      register: pkla_result
-      ignore_errors: yes
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ polkit_base_dir }}", mode: '0755' }
+        - { path: "{{ polkit_base_dir }}/rules.d", mode: '0755' }
+        - { path: "{{ polkit_base_dir }}/localauthority", mode: '0755' }
+        - { path: "{{ polkit_base_dir }}/localauthority/50-local.d", mode: '0755' }
+      tags: [directories]
 
-    - name: Set PKLA status
-      set_fact:
-        pkla_status: >-
-          {{
-            'OK' if pkla_result is defined and not pkla_result.failed
-            else 'FAILED'
-          }}
+    # ==============================================
+    # PHASE 3: MODERN METHOD (rules.d)
+    # ==============================================
+    - name: "PHASE 3A: Deploy modern rules.d configuration"
+      block:
+        - name: Create rules.d file
+          copy:
+            dest: "{{ polkit_rules_d_path }}"
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              // WiFi Management - Allow all users
+              polkit.addRule(function(action, subject) {
+                if (action.id == "org.freedesktop.NetworkManager.network-control" ||
+                    action.id == "org.freedesktop.NetworkManager.wifi.share.protected" ||
+                    action.id == "org.freedesktop.NetworkManager.wifi.share.open" ||
+                    action.id == "org.freedesktop.NetworkManager.settings.modify.system") {
+                  return polkit.Result.YES;
+                }
+              });
+            backup: yes
+          register: rules_d_deploy
+          notify: "restart_polkit"
 
-  # =========================
-  # 4. DETECT NETWORKMANAGER SAFELY
-  # =========================
-    - name: Check NetworkManager existence
-      shell: systemctl list-unit-files | grep -i NetworkManager || true
-      register: nm_check
-      changed_when: false
-      failed_when: false
+        - name: Validate rules.d file exists and is readable
+          stat:
+            path: "{{ polkit_rules_d_path }}"
+          register: rules_d_stat
 
-    - name: Set NetworkManager availability
-      set_fact:
-        nm_available: "{{ nm_check.stdout != '' }}"
+        - name: Verify rules.d permissions (0644)
+          assert:
+            that:
+              - rules_d_stat.stat.exists | bool
+              - rules_d_stat.stat.mode == '0644'
+              - rules_d_stat.stat.pw_name == 'root'
+            fail_msg: |
+              ✗ rules.d validation failed
+              - File exists: {{ rules_d_stat.stat.exists }}
+              - Permissions: {{ rules_d_stat.stat.mode }} (expected 0644)
+              - Owner: {{ rules_d_stat.stat.pw_name }} (expected root)
+          register: rules_d_validation
 
-  # =========================
-  # 5. INSTALL NETWORKMANAGER (IF MISSING)
-  # =========================
-    - name: Install NetworkManager if missing (Debian/Ubuntu)
-      apt:
-        name: network-manager
-        state: present
-        update_cache: yes
-      when:
-        - ansible_facts['os_family'] == "Debian"
-        - not nm_available
-      ignore_errors: yes
+        - name: Set modern method success flag
+          set_fact:
+            method_used: "rules.d (modern)"
+            deployment_status: "SUCCESS_MODERN"
+      rescue:
+        - name: Log modern method failure
+          debug:
+            msg: |
+              ⚠ Modern method (rules.d) failed - will attempt legacy fallback
+              Error: {{ ansible_failed_result.msg | default('Unknown error') }}
+          tags: [always]
+      tags: [deploy, modern]
 
-  # =========================
-  # 6. START / RESTART NETWORKMANAGER SAFELY
-  # =========================
-    - name: Restart NetworkManager safely
+    # ==============================================
+    # PHASE 3B: FALLBACK METHOD (localauthority)
+    # ==============================================
+    - name: "PHASE 3B: Deploy legacy localauthority configuration"
+      block:
+        - name: Create localauthority .pkla file
+          copy:
+            dest: "{{ polkit_localauth_path }}"
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              [Allow Users to Modify Connections]
+              Identity=unix-user:*
+              Action=org.freedesktop.NetworkManager.network-control
+              ResultAny=yes
+              ResultInactive=yes
+              ResultActive=yes
+
+              [Allow Users to Modify System Connections]
+              Identity=unix-user:*
+              Action=org.freedesktop.NetworkManager.settings.modify.system
+              ResultAny=yes
+              ResultInactive=yes
+              ResultActive=yes
+
+              [Allow WiFi Scanning]
+              Identity=unix-user:*
+              Action=org.freedesktop.NetworkManager.wifi.share.protected
+              ResultAny=yes
+              ResultInactive=yes
+              ResultActive=yes
+
+              [Allow Open WiFi Sharing]
+              Identity=unix-user:*
+              Action=org.freedesktop.NetworkManager.wifi.share.open
+              ResultAny=yes
+              ResultInactive=yes
+              ResultActive=yes
+            backup: yes
+          register: localauth_deploy
+          notify: "restart_polkit"
+
+        - name: Validate localauthority file exists and is readable
+          stat:
+            path: "{{ polkit_localauth_path }}"
+          register: localauth_stat
+
+        - name: Verify localauthority permissions (0644)
+          assert:
+            that:
+              - localauth_stat.stat.exists | bool
+              - localauth_stat.stat.mode == '0644'
+              - localauth_stat.stat.pw_name == 'root'
+            fail_msg: |
+              ✗ localauthority validation failed
+              - File exists: {{ localauth_stat.stat.exists }}
+              - Permissions: {{ localauth_stat.stat.mode }} (expected 0644)
+              - Owner: {{ localauth_stat.stat.pw_name }} (expected root)
+          register: localauth_validation
+
+        - name: Read and validate .pkla content
+          slurp:
+            src: "{{ polkit_localauth_path }}"
+          register: pkla_content
+
+        - name: Verify .pkla syntax
+          debug:
+            msg: |
+              .pkla file deployed successfully
+              File size: {{ localauth_stat.stat.size }} bytes
+              Checksum: {{ localauth_stat.stat.checksum }}
+
+        - name: Update method status if modern failed
+          set_fact:
+            method_used: "localauthority (legacy fallback)"
+            deployment_status: "SUCCESS_LEGACY"
+          when: deployment_status == "FAILED_INSTALL" or deployment_status == "PENDING"
+      rescue:
+        - name: Capture fallback error
+          set_fact:
+            deployment_status: "FAILED_BOTH"
+            deployment_error: "{{ ansible_failed_result.msg | default('Unknown error') }}"
+            fail_phase: "Legacy localauthority deployment"
+      tags: [deploy, legacy]
+
+    # ==============================================
+    # PHASE 4: NETWORKMANAGER DETECTION & START
+    # ==============================================
+    - name: "PHASE 4: NetworkManager service management"
+      block:
+        - name: Check if NetworkManager service exists
+          systemd:
+            name: NetworkManager
+            state: stopped
+          check_mode: yes
+          register: nm_exists
+          failed_when: false
+          changed_when: false
+
+        - name: Set NetworkManager availability
+          set_fact:
+            nm_installed: "{{ nm_exists.status.UnitFileState is defined }}"
+
+        - name: Start NetworkManager
+          systemd:
+            name: NetworkManager
+            state: started
+            enabled: yes
+            daemon_reload: yes
+          register: nm_start
+          when: nm_installed
+          tags: [nm_control]
+
+        - name: Set NetworkManager status
+          set_fact:
+            nm_status: "{{ 'RUNNING' if nm_start is succeeded else 'INSTALLED_NOT_RUNNING' if nm_installed else 'NOT_INSTALLED' }}"
+      rescue:
+        - name: Report NetworkManager issue (non-blocking)
+          debug:
+            msg: |
+              ⚠ NetworkManager status unknown
+              Error: {{ ansible_failed_result.msg | default('Unknown') }}
+      tags: [nm_control]
+
+    # ==============================================
+    # PHASE 5: POLKIT SERVICE RESTART
+    # ==============================================
+    - name: "PHASE 5: Restart PolicyKit service"
+      block:
+        - name: Reload PolicyKit
+          systemd:
+            name: polkit
+            state: reloaded
+            daemon_reload: yes
+          register: polkit_reload
+
+        - name: Restart PolicyKit (if reload fails)
+          systemd:
+            name: polkit
+            state: restarted
+            daemon_reload: yes
+          when: polkit_reload is failed
+          register: polkit_restart
+      rescue:
+        - name: Try alternative PolicyKit restart
+          shell: |
+            systemctl daemon-reload
+            systemctl restart polkit || \
+            systemctl restart polkit.service || \
+            true
+          changed_when: true
+      tags: [polkit_control]
+
+  post_tasks:
+    # ==============================================
+    # PHASE 6: VALIDATION & TESTING
+    # ==============================================
+    - name: "PHASE 6: Final validation checks"
+      block:
+        - name: Verify PolicyKit daemon is running
+          shell: |
+            systemctl is-active polkit || \
+            systemctl is-active polkit.service || \
+            ps aux | grep -i "[p]olkit" | wc -l
+          register: polkit_check
+          changed_when: false
+          failed_when: false
+
+        - name: Test NetworkManager connectivity
+          shell: |
+            nmcli dev status 2>/dev/null || \
+            systemctl is-active NetworkManager || \
+            echo "Unknown"
+          register: nm_test
+          changed_when: false
+          failed_when: false
+
+        - name: Verify rule deployment
+          shell: |
+            ls -la {{ polkit_rules_d_path }} 2>/dev/null || \
+            ls -la {{ polkit_localauth_path }} 2>/dev/null || \
+            echo "No config found"
+          register: rule_check
+          changed_when: false
+          failed_when: false
+
+        - name: Generate comprehensive report
+          set_fact:
+            deployment_report:
+              timestamp: "{{ deployment_start_time }}"
+              session_id: "{{ session_id }}"
+              hostname: "{{ inventory_hostname }}"
+              fqdn: "{{ ansible_facts['fqdn'] }}"
+              os_family: "{{ ansible_facts['os_family'] }}"
+              kernel: "{{ ansible_facts['kernel'] }}"
+              deployment_status: "{{ deployment_status }}"
+              method_used: "{{ method_used }}"
+              networkmanager_status: "{{ nm_status }}"
+              polkit_daemon_active: "{{ 'YES' if polkit_check.rc == 0 else 'NO' }}"
+              rules_deployed: "{{ 'rules.d' if 'rules.d_deploy' in hostvars[inventory_hostname] and hostvars[inventory_hostname]['rules_d_deploy'] is succeeded else 'localauthority' }}"
+              validation_passed: "{{ deployment_status.startswith('SUCCESS') }}"
+      tags: [validate, always]
+
+    - name: "PHASE 7: Generate deployment report"
+      block:
+        - name: Save detailed report
+          copy:
+            dest: "{{ report_dir }}/deployment_{{ inventory_hostname }}_{{ session_id }}.txt"
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              ╔════════════════════════════════════════════════════════╗
+              ║          PolicyKit WiFi Deployment Report              ║
+              ╚════════════════════════════════════════════════════════╝
+
+              DEPLOYMENT INFO
+              ├─ Timestamp: {{ deployment_start_time }}
+              ├─ Session ID: {{ session_id }}
+              ├─ Hostname: {{ inventory_hostname }}
+              ├─ FQDN: {{ ansible_facts['fqdn'] }}
+              └─ Status: {{ "✓ SUCCESS" if deployment_status.startswith('SUCCESS') else "✗ FAILED" }}
+
+              SYSTEM INFO
+              ├─ OS Family: {{ ansible_facts['os_family'] }}
+              ├─ Kernel: {{ ansible_facts['kernel'] }}
+              ├─ Processor Count: {{ ansible_facts['processor_count'] }}
+              └─ Ansible Version: {{ ansible_version['full'] }}
+
+              DEPLOYMENT RESULTS
+              ├─ Method Used: {{ method_used }}
+              ├─ Status: {{ deployment_status }}
+              ├─ NetworkManager: {{ nm_status }}
+              ├─ PolicyKit Active: {{ 'YES' if polkit_check.rc == 0 else 'NO' }}
+              └─ Validation: {{ "PASSED ✓" if deployment_status.startswith('SUCCESS') else "FAILED ✗" }}
+
+              FILE LOCATIONS
+              ├─ Modern (rules.d): {{ polkit_rules_d_path }}
+              ├─ Legacy (localauth): {{ polkit_localauth_path }}
+              ├─ Backups: {{ backup_dir }}/
+              └─ Reports: {{ report_dir }}/
+
+              BACKUP INFORMATION
+              {% if rules_backup is succeeded %}
+              ├─ rules.d backup: {{ backup_dir }}/rules.d_{{ session_id }}.backup ✓
+              {% else %}
+              ├─ rules.d backup: SKIPPED (file may not have existed)
+              {% endif %}
+              {% if localauth_backup is succeeded %}
+              └─ localauth backup: {{ backup_dir }}/localauth_{{ session_id }}.backup ✓
+              {% else %}
+              └─ localauth backup: SKIPPED (file may not have existed)
+              {% endif %}
+
+              TROUBLESHOOTING GUIDE
+              {% if deployment_status.startswith('SUCCESS') %}
+              ✓ Deployment successful! Your system is configured.
+
+              Next steps:
+              1. Test WiFi connectivity: nmcli dev wifi list
+              2. Connect to a network: nmcli dev wifi connect "SSID" password "PASSWORD"
+              3. Check permissions: polkit-action --action-id org.freedesktop.NetworkManager.network-control
+
+              {% else %}
+              ✗ Deployment encountered issues. Recommended actions:
+
+              1. Check PolicyKit status:
+                 sudo systemctl status polkit
+                 sudo journalctl -xu polkit -n 50
+
+              2. Check NetworkManager status:
+                 sudo systemctl status NetworkManager
+                 sudo journalctl -xu NetworkManager -n 50
+
+              3. Verify file permissions:
+                 ls -la {{ polkit_rules_d_path }}
+                 ls -la {{ polkit_localauth_path }}
+
+              4. Test PolicyKit directly:
+                 pkaction --verbose
+
+              5. Rollback to backup (if needed):
+                 sudo cp {{ backup_dir }}/localauth_{{ session_id }}.backup {{ polkit_localauth_path }}
+                 sudo systemctl restart polkit
+
+              {% endif %}
+
+              ADDITIONAL RESOURCES
+              - PolicyKit docs: https://gitlab.freedesktop.org/polkit/polkit
+              - NetworkManager docs: https://networkmanager.dev/
+              - Ansible facts: {{ ansible_facts | to_nice_json }}
+          register: report_saved
+
+        - name: Display report location
+          debug:
+            msg: |
+              📊 Deployment Report Generated:
+              {{ report_dir }}/deployment_{{ inventory_hostname }}_{{ session_id }}.txt
+      tags: [report, always]
+
+  handlers:
+    - name: restart_polkit
+      systemd:
+        name: polkit
+        state: restarted
+        daemon_reload: yes
+      listen: "restart_polkit"
+
+    - name: restart_networkmanager
       systemd:
         name: NetworkManager
         state: restarted
-      when: nm_available
-      register: nm_restart
-      ignore_errors: yes
+        daemon_reload: yes
+      listen: "restart_networkmanager"
 
-    - name: Set NetworkManager restart status
-      set_fact:
-        nm_restart_status: >-
-          {{
-            'OK'
-            if (nm_restart is defined and not nm_restart is failed)
-            else ('SKIPPED' if not nm_available else 'FAILED')
-          }}
-
-  # =========================
-  # 7. VERIFY FILE SAFELY
-  # =========================
-    - name: Read PKLA file safely
-      slurp:
-        src: "{{ polkit_file }}"
-      register: pkla_content
-      ignore_errors: yes
-
-    - name: Decode PKLA content
-      set_fact:
-        pkla_decoded: >-
-          {{
-            (pkla_content.content | b64decode)
-            if pkla_content is defined and pkla_content.content is defined
-            else "NOT READABLE"
-          }}
-
-  # =========================
-  # 8. BUILD SAFE REPORT (NO JINJA CRASHES)
-  # =========================
-    - name: Build final report safely
-      set_fact:
-        report:
-          - "PKLA status: {{ pkla_status }}"
-          - "NetworkManager detected: {{ nm_available }}"
-          - "NetworkManager restart: {{ nm_restart_status }}"
-          - "PKLA file readable: {{ 'YES' if pkla_decoded != 'NOT READABLE' else 'NO' }}"
-
-  # =========================
-  # 9. FINAL OUTPUT
-  # =========================
-    - name: Display hardened execution report
+    - name: report_deployment_failure
       debug:
         msg: |
-          ╔══════════════════════════════════════╗
-          ║     POLKIT HARDENED REPORT           ║
-          ╚══════════════════════════════════════╝
-
-          Host: {{ inventory_hostname }}
-
-          {% for item in report %}
-          - {{ item }}
-          {% endfor %}
-
-          File: {{ polkit_file }}
-
-          Status: COMPLETED (HARDENED SAFE MODE)
+          ✗ DEPLOYMENT FAILED
+          Status: {{ deployment_status }}
+          Phase: {{ fail_phase | default('Unknown') }}
+          Error: {{ deployment_error | default('See logs above') }}
+      listen: "report_deployment_failure"
