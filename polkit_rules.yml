@@ -1,0 +1,43 @@
+---
+- name: Configure Polkit rules for NetworkManager (modern method)
+  hosts: all
+  become: yes
+
+  vars:
+    polkit_rule_file: /etc/polkit-1/rules.d/49-network-nopasswd.rules
+    allowed_users:
+      - actserv
+
+  tasks:
+
+    - name: Ensure polkit rules directory exists
+      file:
+        path: /etc/polkit-1/rules.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Deploy Polkit JS rule
+      copy:
+        dest: "{{ polkit_rule_file }}"
+        content: |
+          polkit.addRule(function(action, subject) {
+              if (
+                  (action.id == "org.freedesktop.NetworkManager.network-control" ||
+                   action.id == "org.freedesktop.NetworkManager.settings.modify.system") &&
+                  {{ allowed_users | to_json }}.includes(subject.user)
+              ) {
+                  return polkit.Result.YES;
+              }
+          });
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Verify rule file
+      command: cat {{ polkit_rule_file }}
+      register: rule_output
+
+    - debug:
+        var: rule_output.stdout
