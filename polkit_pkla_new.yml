@@ -1,10 +1,12 @@
 ---
-- name: Configure Polkit PKLA rule for NetworkManager (legacy method)
+- name: Configure Polkit PKLA rule (safe + graceful + reporting)
   hosts: all
   become: yes
+  gather_facts: yes
 
   vars:
     polkit_file: /etc/polkit-1/localauthority/50-local.d/10-network-manager.pkla
+    report: []
 
   tasks:
 
@@ -29,15 +31,56 @@
         owner: root
         group: root
         mode: '0644'
+      register: pkla_result
 
-    - name: Restart NetworkManager
+    - name: Record PKLA deployment status
+      set_fact:
+        report: "{{ report + ['PKLA deployed: ' ~ (pkla_result.changed | ternary('CHANGED','OK'))] }}"
+
+    - name: Check if NetworkManager exists
+      shell: systemctl list-unit-files | grep -i NetworkManager || true
+      register: nm_check
+      changed_when: false
+
+    - name: Restart NetworkManager (only if available)
       systemd:
         name: NetworkManager
         state: restarted
+      when: nm_check.stdout != ""
+      register: nm_restart
+      ignore_errors: yes
 
-    - name: Confirm PKLA file deployed
-      command: cat {{ polkit_file }}
-      register: pkla_output
+    - name: Record NetworkManager status
+      set_fact:
+        report: "{{ report + ['NetworkManager restart: ' ~ (nm_restart is defined and not nm_restart.failed | ternary('OK','SKIPPED/FAILED'))] }}"
 
-    - debug:
-        var: pkla_output.stdout
+    - name: Confirm PKLA file content safely
+      slurp:
+        src: "{{ polkit_file }}"
+      register: pkla_content
+
+    - name: Decode file content
+      set_fact:
+        decoded_pkla: "{{ pkla_content.content | b64decode }}"
+
+    - name: Build final report
+      set_fact:
+        report: "{{ report + ['PKLA file exists and readable'] }}"
+
+    - name: Display final execution report
+      debug:
+        msg: |
+          ╔══════════════════════════════════════╗
+          ║      POLKIT CONFIGURATION REPORT     ║
+          ╚══════════════════════════════════════╝
+
+          Host: {{ inventory_hostname }}
+
+          {% for item in report %}
+          - {{ item }}
+          {% endfor %}
+
+          File Path:
+          {{ polkit_file }}
+
+          Status: COMPLETED (SAFE MODE)
