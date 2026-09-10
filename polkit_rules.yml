@@ -1,9 +1,8 @@
 ---
-- name: Configure Polkit rules for NetworkManager (modern method)
+- name: Configure Polkit NetworkManager rule (stable Semaphore version)
   hosts: all
   become: yes
   become_method: sudo
-  become_user: root
 
   vars:
     polkit_rule_file: /etc/polkit-1/rules.d/49-network-nopasswd.rules
@@ -16,13 +15,27 @@
       file:
         path: /etc/polkit-1/rules.d
         state: directory
-        owner: root
-        group: root
         mode: '0755'
 
-    - name: Deploy Polkit JS rule
+    - name: Install NetworkManager if missing (fix your failure)
+      apt:
+        name: network-manager
+        state: present
+        update_cache: yes
+      when: ansible_facts['os_family'] == "Debian"
+
+    - name: Ensure NetworkManager is running
+      systemd:
+        name: NetworkManager
+        state: started
+        enabled: yes
+
+    - name: Deploy Polkit rule safely (no pre-checks)
       copy:
         dest: "{{ polkit_rule_file }}"
+        owner: root
+        group: root
+        mode: '0644'
         content: |
           polkit.addRule(function(action, subject) {
               if (
@@ -33,13 +46,13 @@
                   return polkit.Result.YES;
               }
           });
-        owner: root
-        group: root
-        mode: '0644'
 
-    - name: Verify rule file
-      command: cat {{ polkit_rule_file }}
-      register: rule_output
+    - name: Restart polkit
+      systemd:
+        name: polkit
+        state: restarted
 
-    - debug:
-        var: rule_output.stdout
+    - name: Restart NetworkManager
+      systemd:
+        name: NetworkManager
+        state: restarted
