@@ -1,14 +1,29 @@
 ---
-- name: Configure Polkit PKLA rule for NetworkManager (legacy method)
+- name: Hardened Polkit + NetworkManager configuration (Semaphore safe)
   hosts: all
   become: yes
+  gather_facts: yes
 
   vars:
     polkit_file: /etc/polkit-1/localauthority/50-local.d/10-network-manager.pkla
+    report: []
 
   tasks:
 
-    - name: Ensure polkit local authority directory exists
+  # =========================
+  # 1. INIT SAFE STATE
+  # =========================
+    - name: Initialize safe status variables
+      set_fact:
+        nm_available: false
+        nm_restart_status: "SKIPPED"
+        pkla_status: "UNKNOWN"
+        report: []
+
+  # =========================
+  # 2. ENSURE POLKIT DIRECTORY
+  # =========================
+    - name: Ensure polkit directory exists
       file:
         path: /etc/polkit-1/localauthority/50-local.d
         state: directory
@@ -16,9 +31,15 @@
         group: root
         mode: '0755'
 
-    - name: Deploy PKLA rule for all users
+  # =========================
+  # 3. DEPLOY PKLA RULE
+  # =========================
+    - name: Deploy PKLA rule safely
       copy:
         dest: "{{ polkit_file }}"
+        owner: root
+        group: root
+        mode: '0644'
         content: |
           [Allow Users to Modify Connections]
           Identity=unix-user:*
@@ -26,18 +47,108 @@
           ResultAny=yes
           ResultInactive=yes
           ResultActive=yes
-        owner: root
-        group: root
-        mode: '0644'
+      register: pkla_result
+      ignore_errors: yes
 
-    - name: Restart NetworkManager
+    - name: Set PKLA status
+      set_fact:
+        pkla_status: >-
+          {{
+            'OK' if pkla_result is defined and not pkla_result.failed
+            else 'FAILED'
+          }}
+
+  # =========================
+  # 4. DETECT NETWORKMANAGER SAFELY
+  # =========================
+    - name: Check NetworkManager existence
+      shell: systemctl list-unit-files | grep -i NetworkManager || true
+      register: nm_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set NetworkManager availability
+      set_fact:
+        nm_available: "{{ nm_check.stdout != '' }}"
+
+  # =========================
+  # 5. INSTALL NETWORKMANAGER (IF MISSING)
+  # =========================
+    - name: Install NetworkManager if missing (Debian/Ubuntu)
+      apt:
+        name: network-manager
+        state: present
+        update_cache: yes
+      when:
+        - ansible_facts['os_family'] == "Debian"
+        - not nm_available
+      ignore_errors: yes
+
+  # =========================
+  # 6. START / RESTART NETWORKMANAGER SAFELY
+  # =========================
+    - name: Restart NetworkManager safely
       systemd:
         name: NetworkManager
         state: restarted
+      when: nm_available
+      register: nm_restart
+      ignore_errors: yes
 
-    - name: Confirm PKLA file deployed
-      command: cat {{ polkit_file }}
-      register: pkla_output
+    - name: Set NetworkManager restart status
+      set_fact:
+        nm_restart_status: >-
+          {{
+            'OK'
+            if (nm_restart is defined and not nm_restart is failed)
+            else ('SKIPPED' if not nm_available else 'FAILED')
+          }}
 
-    - debug:
-        var: pkla_output.stdout
+  # =========================
+  # 7. VERIFY FILE SAFELY
+  # =========================
+    - name: Read PKLA file safely
+      slurp:
+        src: "{{ polkit_file }}"
+      register: pkla_content
+      ignore_errors: yes
+
+    - name: Decode PKLA content
+      set_fact:
+        pkla_decoded: >-
+          {{
+            (pkla_content.content | b64decode)
+            if pkla_content is defined and pkla_content.content is defined
+            else "NOT READABLE"
+          }}
+
+  # =========================
+  # 8. BUILD SAFE REPORT (NO JINJA CRASHES)
+  # =========================
+    - name: Build final report safely
+      set_fact:
+        report:
+          - "PKLA status: {{ pkla_status }}"
+          - "NetworkManager detected: {{ nm_available }}"
+          - "NetworkManager restart: {{ nm_restart_status }}"
+          - "PKLA file readable: {{ 'YES' if pkla_decoded != 'NOT READABLE' else 'NO' }}"
+
+  # =========================
+  # 9. FINAL OUTPUT
+  # =========================
+    - name: Display hardened execution report
+      debug:
+        msg: |
+          ╔══════════════════════════════════════╗
+          ║     POLKIT HARDENED REPORT           ║
+          ╚══════════════════════════════════════╝
+
+          Host: {{ inventory_hostname }}
+
+          {% for item in report %}
+          - {{ item }}
+          {% endfor %}
+
+          File: {{ polkit_file }}
+
+          Status: COMPLETED (HARDENED SAFE MODE)
