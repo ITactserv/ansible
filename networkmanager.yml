@@ -1,0 +1,38 @@
+---
+- name: Configure Polkit rule for NetworkManager access
+  hosts: all
+  become: true
+
+  vars:
+    polkit_file: /etc/polkit-1/localauthority/50-local.d/10-network-manager.pkla
+
+  tasks:
+
+    - name: Ensure polkit directory exists
+      file:
+        path: /etc/polkit-1/localauthority/50-local.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Deploy NetworkManager polkit rule
+      copy:
+        dest: "{{ polkit_file }}"
+        content: |
+          [Allow Users to Modify Connections]
+          Identity=unix-user:*
+          Action=org.freedesktop.NetworkManager.network-control
+          ResultAny=yes
+          ResultInactive=yes
+          ResultActive=yes
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart NetworkManager
+
+  handlers:
+    - name: Restart NetworkManager
+      systemd:
+        name: NetworkManager
+        state: restarted
