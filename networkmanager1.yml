@@ -1,0 +1,42 @@
+---
+- name: Allow all users to control NetworkManager without password
+  hosts: all
+  become: true
+
+  vars:
+    polkit_rule_file: /etc/polkit-1/rules.d/49-network-nopasswd.rules
+
+  tasks:
+
+    - name: Ensure polkit rules directory exists
+      file:
+        path: /etc/polkit-1/rules.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Deploy Polkit JS rule for all users
+      copy:
+        dest: "{{ polkit_rule_file }}"
+        content: |
+          polkit.addRule(function(action, subject) {
+              if (
+                  (action.id == "org.freedesktop.NetworkManager.network-control" ||
+                   action.id == "org.freedesktop.NetworkManager.settings.modify.system") &&
+                  subject.active == true
+              ) {
+                  return polkit.Result.YES;
+              }
+          });
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload polkit
+
+  handlers:
+    - name: Reload polkit
+      systemd:
+        name: polkit
+        state: restarted
+      ignore_errors: true
